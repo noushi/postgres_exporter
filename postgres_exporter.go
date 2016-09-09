@@ -1,27 +1,24 @@
 package main
 
 import (
-	//"bytes"
 	"database/sql"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"math"
 	"net/http"
 	"os"
-	//"regexp"
-	//"strconv"
-	//"strings"
-	"math"
+	"strconv"
 	"time"
-	"io/ioutil"
+
 	"gopkg.in/yaml.v2"
 
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/log"
-	"strconv"
+	"github.com/prometheus/common/log"
 )
 
-var Version string = "0.0.0-dev"
+var Version string = "0.0.1"
 
 var (
 	listenAddress = flag.String(
@@ -35,6 +32,10 @@ var (
 	queriesPath = flag.String(
 		"extend.query-path", "",
 		"Path to custom queries to run.",
+	)
+	onlyDumpMaps = flag.Bool(
+		"dumpmaps", false,
+		"Do not run, simply dump the maps.",
 	)
 )
 
@@ -109,6 +110,21 @@ var variableMaps = map[string]map[string]ColumnMapping{
 		"max_standby_streaming_delay": {DURATION, "Sets the maximum delay before canceling queries when a hot standby server is processing streamed WAL data.", nil},
 		"max_wal_senders":             {GAUGE, "Sets the maximum number of simultaneously running WAL sender processes.", nil},
 	},
+}
+
+func dumpMaps() {
+	for name, cmap := range metricMaps {
+		query, ok := queryOverrides[name]
+		if ok {
+			fmt.Printf("%s: %s\n", name, query)
+		} else {
+			fmt.Println(name)
+		}
+		for column, details := range cmap {
+			fmt.Printf("  %-40s %v\n", column, details)
+		}
+		fmt.Println()
+	}
 }
 
 var metricMaps = map[string]map[string]ColumnMapping{
@@ -235,7 +251,6 @@ func addQueries(queriesPath string) (err error) {
 		return err
 	}
 
-
 	for metric, specs := range extra {
 		for key, value := range specs.(map[interface{}]interface{}) {
 			switch key.(string) {
@@ -249,14 +264,16 @@ func addQueries(queriesPath string) (err error) {
 
 					for n, a := range column {
 						var cmap ColumnMapping
-						var metric_map map[string]ColumnMapping
 
-						metric_map = make(map[string]ColumnMapping)
+						metric_map, ok := metricMaps[metric]
+						if !ok {
+							metric_map = make(map[string]ColumnMapping)
+						}
 
 						name := n.(string)
 
 						for attr_key, attr_val := range a.(map[interface{}]interface{}) {
-							switch(attr_key.(string)) {
+							switch attr_key.(string) {
 							case "usage":
 								usage, err := stringToColumnUsage(attr_val.(string))
 								if err != nil {
@@ -355,6 +372,10 @@ func makeDescMap(metricMaps map[string]map[string]ColumnMapping) map[string]Metr
 							return math.NaN(), false
 						}
 
+						if durationString == "-1" {
+							return math.NaN(), false
+						}
+
 						d, err := time.ParseDuration(durationString)
 						if err != nil {
 							log.Errorln("Failed converting result to metric:", columnName, in, err)
@@ -374,7 +395,7 @@ func makeDescMap(metricMaps map[string]map[string]ColumnMapping) map[string]Metr
 
 // convert a string to the corresponding ColumnUsage
 func stringToColumnUsage(s string) (u ColumnUsage, err error) {
-	switch(s) {
+	switch s {
 	case "DISCARD":
 		u = DISCARD
 
@@ -415,6 +436,13 @@ func dbToFloat64(t interface{}) (float64, bool) {
 		strV := string(v)
 		result, err := strconv.ParseFloat(strV, 64)
 		if err != nil {
+			return math.NaN(), false
+		}
+		return result, true
+	case string:
+		result, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			log.Infoln("Could not parse string:", err)
 			return math.NaN(), false
 		}
 		return result, true
@@ -536,7 +564,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 	db, err := sql.Open("postgres", e.dsn)
 	if err != nil {
-		log.Println("Error opening connection to database:", err)
+		log.Infoln("Error opening connection to database:", err)
 		e.error.Set(1)
 		return
 	}
@@ -582,7 +610,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			// Don't fail on a bad scrape of one metric
 			rows, err := db.Query(query)
 			if err != nil {
-				log.Println("Error running query on database: ", namespace, err)
+				log.Infoln("Error running query on database: ", namespace, err)
 				e.error.Set(1)
 				return
 			}
@@ -591,7 +619,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			var columnNames []string
 			columnNames, err = rows.Columns()
 			if err != nil {
-				log.Println("Error retrieving column list for: ", namespace, err)
+				log.Infoln("Error retrieving column list for: ", namespace, err)
 				e.error.Set(1)
 				return
 			}
@@ -611,7 +639,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			for rows.Next() {
 				err = rows.Scan(scanArgs...)
 				if err != nil {
-					log.Println("Error retrieving rows:", namespace, err)
+					log.Infoln("Error retrieving rows:", namespace, err)
 					e.error.Set(1)
 					return
 				}
@@ -666,16 +694,21 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 func main() {
 	flag.Parse()
 
-	dsn := os.Getenv("DATA_SOURCE_NAME")
-	if len(dsn) == 0 {
-		log.Fatal("couldn't find environment variable DATA_SOURCE_NAME")
-	}
-
 	if *queriesPath != "" {
 		err := addQueries(*queriesPath)
 		if err != nil {
 			log.Warnln("Unparseable queries file - discarding merge: ", *queriesPath, err)
 		}
+	}
+
+	if *onlyDumpMaps {
+		dumpMaps()
+		return
+	}
+
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+	if len(dsn) == 0 {
+		log.Fatal("couldn't find environment variable DATA_SOURCE_NAME")
 	}
 
 	exporter := NewExporter(dsn)
